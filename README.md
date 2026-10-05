@@ -32,11 +32,15 @@ The executable is written to `build\bin\Release\vramtiming.exe`.
 ## Run
 
 ```
-vramtiming.exe <megabytes>
+vramtiming.exe <megabytes> [-flip]
 ```
 
 For example `vramtiming.exe 512` (fits in video memory) or `vramtiming.exe 8192` (more than a 6 GB GPU
-can hold).
+can hold). `-flip` (or `--flip`, before or after the size) switches between two sets of render
+targets, see [-flip](#-flip) below.
+
+At startup it waits 2 seconds before creating the D3D12 device, so that an ETW monitor started
+separately (such as `dxtcl_monitor`) has its session running before any D3D12 object is created.
 
 ## Reading the output
 
@@ -63,6 +67,51 @@ slow if its median is more than 4x the fast reference. This assumes at least 10%
 are in video memory, which holds unless the allocation is many times the GPU's memory.
 
 If the timing and the kernel agree, `system memory (slow)` and `evicted (kernel)` are about the same.
+
+## -flip
+
+```
+vramtiming.exe 3072 -flip
+```
+
+Allocates twice the requested amount, as two equally sized sets of 16 MiB render targets:
+set A = `RT_0` .. `RT_<N-1>` and set B = `RT_<N>` .. `RT_<2N-1>` (N = `<megabytes> / 16`; the names
+keep one global index, so tools that parse `RT_<index>` work unchanged). If creation runs out of
+memory, the render targets that were created are split into two halves and a line says so.
+
+Each frame only the active set is rendered, with the same chain as above (the first render target of
+the set is noise from the seed, each next one reads the previous one). It starts with set A and switches
+to the other set every 10 seconds, so one set is in use while the other sits idle. The window shows the
+last render target of the active set. This shows whether the kernel moves the set that becomes active
+back into video memory (and the idle one out).
+
+```
+t=10s  [set A: RT_0..RT_191]  allocated 2 x 3072 MB | VRAM (fast) 2944 MB [184 RTs] | system memory (slow) 128 MB [8 RTs] | evicted (kernel) 3056 MB | frame 34.3 ms
+t=10s  flip -> rendering set B (RT_192..RT_383)
+t=11s  [set B: RT_192..RT_383]  allocated 2 x 3072 MB | VRAM (fast) 528 MB [33 RTs] | system memory (slow) 2544 MB [159 RTs] | evicted (kernel) 3056 MB | frame 728.0 ms
+  slow: 224-315, 317-383
+```
+
+| Field | Meaning |
+|---|---|
+| `flip -> rendering set B (...)` | from this point on only set B is rendered; printed right after the report for that second |
+| `[set B: RT_192..RT_383]` | the set that was rendered (and measured) during the last second |
+| `allocated 2 x 3072 MB` | two sets of 3072 MB each |
+| `VRAM (fast)`, `system memory (slow)`, `slow:` | as above, but for the active set only. The idle set is not drawn, so it is not measured: its render targets are never counted or listed, wherever they are. The `slow:` ranges use the global `RT_<index>` |
+| `evicted (kernel)` | unchanged: the whole process, so it includes the idle set |
+| `frame` | GPU time for the active set's chain |
+
+On a flip the timing samples are discarded, so the first report after a flip only contains draws of
+the new set, and its `slow:` line is always printed.
+
+## Validity
+
+The per-render-target timing only detects demotion when demoted render targets are actually accessed
+in system memory. If video memory is extremely constrained, the kernel may instead page whole batches
+of allocations in and out between command lists. Then every render target looks fast during its own
+draw, and the cost shows up only as a huge frame time. On an RTX 2060 a normal 8192 MB run shows frames
+of about 600 ms; we once saw frames of 1-19 s with every render target classified fast. Treat runs with
+such frame times as invalid ground truth.
 
 ## Files
 
