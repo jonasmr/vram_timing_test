@@ -1,6 +1,6 @@
 // vramtiming: ground-truth test for GPU memory demotion.
 //
-// Usage: vramtiming <megabytes> [-flip]
+// Usage: vramtiming <megabytes> [-flip | -promote]
 //
 // Allocates <megabytes>/16 render targets of 16 MiB each and renders ALL of them every frame. When the
 // total exceeds what the OS lets this process keep in video memory, the graphics kernel demotes some of
@@ -9,9 +9,15 @@
 // video memory (fast) and which in system memory (slow). Once per second this is printed next to the
 // kernel's own count of demoted bytes, so the two can be compared.
 //
-// With -flip it allocates twice that, as two equally sized sets A and B, renders only one set at a time
-// and switches to the other set every 10 seconds. The timing then shows whether the set that becomes
-// active is promoted back to video memory (and the idle one demoted). Only the active set is measured.
+// With -flip those render targets are set A, and it renders set A for 60 s, then allocates an equally
+// sized set B and renders only B for 60 s (A stays allocated but idle), then renders A again and
+// releases B, until the window is closed. The timing then shows whether the set that becomes active is
+// promoted back to video memory (and the idle one demoted). Only the active set is measured.
+//
+// With -promote it renders set A for 10 s, then allocates set B and renders only B, and at 20 s releases
+// set A while it keeps rendering B until the window is closed. B is created under memory pressure, so
+// part of it starts out in system memory; once A is gone there is room, and the timing shows whether
+// the kernel promotes B back into video memory.
 //
 // "MB" in the output means MiB (1024 * 1024 bytes).
 
@@ -20,10 +26,10 @@
 #include "shaders.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
-#include <string>
 #include <vector>
 
 namespace
@@ -37,14 +43,16 @@ constexpr UINT kWindowSize = 1024;
 // several command lists (all submitted together) to keep every GPU packet well below the TDR limit.
 constexpr UINT kDrawsPerCommandList = 32;
 constexpr double kSlowFactor = 4.0; // see Classify()
-constexpr ULONGLONG kFlipSeconds = 10;
+constexpr ULONGLONG kFlipSeconds = 60;    // -flip: time per phase (A, then B, then A until closed)
+constexpr ULONGLONG kPromoteSeconds = 10; // -promote: time per phase (A, then B, then B without A until closed)
 
 // ---- Test state ----
 
 Gpu g_gpu;
-std::vector<ComPtr<ID3D12Resource>> g_rts; // the render targets under test, named RT_0 .. RT_<N-1>
+UINT g_setSize = 0;                        // render targets requested per set: <megabytes> / 16
+std::vector<ComPtr<ID3D12Resource>> g_rts; // the render targets under test, named RT_0 .. RT_<count-1>
 DescriptorHeap g_rtvs;                     // RTV i = RT i
-DescriptorHeap g_srvs;                     // SRV i = RT i, SRV N = null (RT 0 has no predecessor)
+DescriptorHeap g_srvs;                     // SRV i = RT i, SRV MaxRtCount() = null (first RT has no predecessor)
 ComPtr<ID3D12RootSignature> g_rootSignature;
 ComPtr<ID3D12PipelineState> g_chainPipeline;
 ComPtr<ID3D12PipelineState> g_showPipeline;
@@ -57,23 +65,37 @@ double g_msPerTick = 0;
 std::mt19937 g_random{ std::random_device{}() };
 std::vector<std::vector<double>> g_drawMs; // per RT: its draw times during the current second
 std::vector<double> g_frameMs;             // per frame of the current second: GPU time of the whole chain
-std::vector<bool> g_previousSlow;          // classification printed in the previous report
 
 // The render targets that are rendered and measured: RT_<g_activeFirst> .. RT_<g_activeFirst + g_activeCount - 1>.
-// Without -flip that is all of them. With -flip it is set A (the first half) or set B (the second half).
+// Without -flip/-promote that is all of them. Otherwise it is set A (RT_0 ..) or set B (the RTs after
+// set A). Set B only exists while it is the active set.
+// -promote releases set A while B stays active: A's entries in g_rts are then null, so that set B keeps
+// its indices (and with them its descriptors and queries). Nothing touches RTs outside the active set.
 bool g_flip = false;
+bool g_promote = false;
+bool g_setAReleased = false; // -promote, from 2 * kPromoteSeconds
 UINT g_activeFirst = 0;
 UINT g_activeCount = 0;
 
+bool TwoSets() { return g_flip || g_promote; }
 UINT RtCount() { return (UINT)g_rts.size(); }
+UINT MaxRtCount() { return TwoSets() ? 2 * g_setSize : g_setSize; } // descriptors and queries are sized for this
 UINT ActiveLast() { return g_activeFirst + g_activeCount - 1; }
 char ActiveSetName() { return g_activeFirst == 0 ? 'A' : 'B'; }
 
 // ---- Setup ----
 
-// Creates up to `count` committed 16 MiB render targets in the DEFAULT heap, named RT_<index>.
-// If the device runs out of memory, continues with the ones created so far.
-void CreateRenderTargets(UINT count)
+// RTV and SRV heaps for up to MaxRtCount() render targets, plus the null SRV after them.
+void CreateDescriptorHeaps()
+{
+    g_rtvs = CreateDescriptorHeap(g_gpu.device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, MaxRtCount(), false);
+    g_srvs = CreateDescriptorHeap(g_gpu.device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, MaxRtCount() + 1, true);
+    CreateNullTextureSrv(g_gpu.device.Get(), kRtFormat, g_srvs.Cpu(MaxRtCount()));
+}
+
+// Appends up to `count` committed 16 MiB render targets in the DEFAULT heap to g_rts, named RT_<index>,
+// and writes their RTV and SRV. If the device runs out of memory, stops there. Returns how many it created.
+UINT CreateRenderTargets(UINT count)
 {
     D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
     D3D12_RESOURCE_DESC desc{};
@@ -95,25 +117,17 @@ void CreateRenderTargets(UINT count)
         {
             printf("CreateCommittedResource failed (hr=0x%08X) after %u of %u render targets, continuing with %u\n",
                 (unsigned)hr, i, count, i);
-            break;
+            return i;
         }
+        const UINT index = RtCount();
         wchar_t name[32];
-        swprintf_s(name, L"RT_%u", i);
+        swprintf_s(name, L"RT_%u", index);
         rt->SetName(name);
+        g_gpu.device->CreateRenderTargetView(rt.Get(), nullptr, g_rtvs.Cpu(index));
+        g_gpu.device->CreateShaderResourceView(rt.Get(), nullptr, g_srvs.Cpu(index));
         g_rts.push_back(rt);
     }
-    if (g_rts.empty())
-        CheckHr(E_OUTOFMEMORY, "creating any render target");
-
-    const UINT n = RtCount();
-    g_rtvs = CreateDescriptorHeap(g_gpu.device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, n, false);
-    g_srvs = CreateDescriptorHeap(g_gpu.device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, n + 1, true);
-    for (UINT i = 0; i < n; ++i)
-    {
-        g_gpu.device->CreateRenderTargetView(g_rts[i].Get(), nullptr, g_rtvs.Cpu(i));
-        g_gpu.device->CreateShaderResourceView(g_rts[i].Get(), nullptr, g_srvs.Cpu(i));
-    }
-    CreateNullTextureSrv(g_gpu.device.Get(), kRtFormat, g_srvs.Cpu(n));
+    return count;
 }
 
 void CreatePipelines()
@@ -126,7 +140,7 @@ void CreatePipelines()
     g_showPipeline = CreateFullscreenPipeline(device, g_rootSignature.Get(), vs.Get(),
         CompileShader(kShaders, "ShowPS", "ps_5_0").Get(), kBackBufferFormat);
 
-    g_chainLists.resize((g_activeCount + kDrawsPerCommandList - 1) / kDrawsPerCommandList);
+    g_chainLists.resize((g_setSize + kDrawsPerCommandList - 1) / kDrawsPerCommandList); // enough for either set
     for (CommandList& list : g_chainLists)
         list = CreateCommandList(device);
     g_showList = CreateCommandList(device);
@@ -134,7 +148,7 @@ void CreatePipelines()
 
 void CreateTimestampQueries()
 {
-    const UINT queryCount = 2 * RtCount();
+    const UINT queryCount = 2 * MaxRtCount();
     D3D12_QUERY_HEAP_DESC desc{ D3D12_QUERY_HEAP_TYPE_TIMESTAMP, queryCount, 0 };
     CHECK(g_gpu.device->CreateQueryHeap(&desc, IID_PPV_ARGS(&g_timestamps)));
     g_timestampReadback = CreateReadbackBuffer(g_gpu.device.Get(), UINT64(queryCount) * sizeof(UINT64));
@@ -142,7 +156,7 @@ void CreateTimestampQueries()
     UINT64 ticksPerSecond = 0;
     CHECK(g_gpu.queue->GetTimestampFrequency(&ticksPerSecond));
     g_msPerTick = 1000.0 / double(ticksPerSecond);
-    g_drawMs.resize(RtCount());
+    g_drawMs.resize(MaxRtCount());
 }
 
 // ---- Frame ----
@@ -169,7 +183,7 @@ void DrawChainLink(ID3D12GraphicsCommandList* cl, UINT i, UINT seed)
     ID3D12Resource* rt = g_rts[i].Get();
     const UINT constants[2] = { seed, i };
     cl->SetGraphicsRoot32BitConstants(0, 2, constants, 0);
-    cl->SetGraphicsRootDescriptorTable(1, g_srvs.Gpu(i > g_activeFirst ? i - 1 : RtCount()));
+    cl->SetGraphicsRootDescriptorTable(1, g_srvs.Gpu(i > g_activeFirst ? i - 1 : MaxRtCount()));
 
     cl->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2 * i);
     const D3D12_RESOURCE_BARRIER toTarget = Transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -259,8 +273,8 @@ double Median(std::vector<double> values)
 }
 
 // Classifies every render target of the active set from its draw times during the last second.
-// true = slow. The result is indexed by global RT index; RTs outside the active set (the idle set with
-// -flip) are not drawn, so not measured, and are always false.
+// true = slow. The result is indexed by global RT index; RTs outside the active set (the idle or
+// released set) are not drawn, so not measured, and are always false.
 //  - Per RT we take the MEDIAN draw time, so a single slow frame (e.g. while the OS is paging) does not
 //    change the result.
 //  - The fast reference is the 10th percentile of those medians: the draw time of an RT in video memory,
@@ -285,22 +299,11 @@ std::vector<bool> Classify()
     return slow;
 }
 
-// Indices where slow[i] is true, as ranges: "0-12, 40-283". "none" if there are none.
-std::string FormatRanges(const std::vector<bool>& slow)
+void ClearSamples()
 {
-    std::string text;
-    for (size_t i = 0; i < slow.size(); ++i)
-    {
-        if (!slow[i])
-            continue;
-        size_t last = i;
-        while (last + 1 < slow.size() && slow[last + 1])
-            ++last;
-        text += text.empty() ? "" : ", ";
-        text += last == i ? std::to_string(i) : std::to_string(i) + "-" + std::to_string(last);
-        i = last;
-    }
-    return text.empty() ? "none" : text;
+    for (std::vector<double>& times : g_drawMs)
+        times.clear();
+    g_frameMs.clear();
 }
 
 void PrintReport(ULONGLONG seconds)
@@ -310,65 +313,108 @@ void PrintReport(ULONGLONG seconds)
     const UINT slowCount = (UINT)std::count(slow.begin(), slow.end(), true);
     const UINT fastCount = n - slowCount;
 
-    // Process-wide: includes the idle set with -flip.
+    // Process-wide: includes the idle set while both sets exist.
     char evicted[32] = "n/a";
     uint64_t demotedBytes = 0;
     if (QueryKernelDemotedBytes(g_gpu.adapterDesc.AdapterLuid, &demotedBytes))
-        sprintf_s(evicted, "%llu MB", (unsigned long long)(demotedBytes >> 20));
+        sprintf_s(evicted, "%lluMB", (unsigned long long)(demotedBytes >> 20));
 
+    // What is allocated right now. Set B exists only while it is the active set, and set A is then
+    // RT_0 .. RT_<g_activeFirst - 1>, unless -promote has released it.
     char setAndAllocated[64];
-    if (g_flip)
-        sprintf_s(setAndAllocated, "[set %c: RT_%u..RT_%u]  allocated 2 x %u MB", ActiveSetName(), g_activeFirst, ActiveLast(), n * kRtMegabytes);
+    const UINT activeMb = n * kRtMegabytes, setAMb = g_activeFirst * kRtMegabytes;
+    if (!TwoSets())
+        sprintf_s(setAndAllocated, "%u MB", activeMb);
+    else if (ActiveSetName() == 'A')
+        sprintf_s(setAndAllocated, "set A RT_0..%u | %u MB", ActiveLast(), activeMb);
+    else if (g_setAReleased)
+        sprintf_s(setAndAllocated, "set B RT_%u..%u | %u MB", g_activeFirst, ActiveLast(), activeMb);
+    else if (setAMb == activeMb)
+        sprintf_s(setAndAllocated, "set B RT_%u..%u | 2x%u MB", g_activeFirst, ActiveLast(), activeMb);
     else
-        sprintf_s(setAndAllocated, "allocated %u MB", n * kRtMegabytes);
+        sprintf_s(setAndAllocated, "set B RT_%u..%u | %u+%u MB", g_activeFirst, ActiveLast(), setAMb, activeMb);
 
-    printf("t=%llus  %s | VRAM (fast) %u MB [%u RTs] | system memory (slow) %u MB [%u RTs] | evicted (kernel) %s | frame %.1f ms\n",
+    // Worst case (5-digit MB, 4-digit RT counts and frame ms) is ~140 chars.
+    printf("t=%llus  %s | vram(fast) %uMB/%u | sys(slow) %uMB/%u | evicted(kernel) %s | frame %.1f ms\n",
         seconds, setAndAllocated, fastCount * kRtMegabytes, fastCount, slowCount * kRtMegabytes, slowCount, evicted,
         Median(g_frameMs));
-    if (slow != g_previousSlow)
-        printf("  slow: %s\n", FormatRanges(slow).c_str());
-
-    g_previousSlow = slow;
-    for (std::vector<double>& times : g_drawMs)
-        times.clear();
-    g_frameMs.clear();
+    ClearSamples();
 }
 
-// -flip: switches rendering to the other set. Drops the timing samples (so none from the previous set
-// end up in the next report) and the previous classification (so the next report prints its slow ranges).
-void Flip(ULONGLONG seconds)
+// ---- -flip / -promote transitions ----
+// All of them drop the timing samples, so none from the previous set end up in the next report.
+
+// At the end of the first phase (kFlipSeconds or kPromoteSeconds): allocates set B (up to g_setSize more RTs, right after set A) and renders only B.
+// Returns false if not a single RT of set B could be created; then it keeps rendering set A.
+bool AllocateSetB(ULONGLONG seconds)
 {
-    g_activeFirst = g_activeFirst == 0 ? g_activeCount : 0;
-    for (std::vector<double>& times : g_drawMs)
-        times.clear();
-    g_frameMs.clear();
-    g_previousSlow.clear();
-    printf("t=%llus  flip -> rendering set %c (RT_%u..RT_%u)\n", seconds, ActiveSetName(), g_activeFirst, ActiveLast());
+    const UINT first = RtCount();
+    const UINT count = CreateRenderTargets(g_setSize);
+    if (count == 0)
+    {
+        printf("t=%llus  out of memory: could not allocate set B, still rendering set A\n", seconds);
+        return false;
+    }
+    g_activeFirst = first;
+    g_activeCount = count;
+    ClearSamples();
+    printf("t=%llus  allocated set B (RT_%u..RT_%u%s), rendering set B\n", seconds, first, ActiveLast(),
+        count < g_setSize ? ", fewer than requested: out of memory" : "");
+    return true;
+}
+
+// -flip, at 2 * kFlipSeconds: renders set A again and releases set B.
+void ReleaseSetB(ULONGLONG seconds)
+{
+    const UINT setACount = g_activeFirst, last = ActiveLast();
+    WaitForGpu(g_gpu); // no submitted work may still use set B when it is released
+    g_rts.resize(setACount);
+    g_activeFirst = 0;
+    g_activeCount = setACount;
+    ClearSamples();
+    printf("t=%llus  rendering set A, released set B (RT_%u..RT_%u)\n", seconds, setACount, last);
+}
+
+// -promote, at 2 * kPromoteSeconds: releases set A and keeps rendering set B. Set A is at the front of
+// g_rts, so its entries are set to null instead of removed, and set B keeps its indices.
+void ReleaseSetA(ULONGLONG seconds)
+{
+    const UINT setACount = g_activeFirst;
+    WaitForGpu(g_gpu); // no submitted work may still use set A when it is released
+    for (UINT i = 0; i < setACount; ++i)
+        g_rts[i].Reset();
+    g_setAReleased = true;
+    ClearSamples();
+    printf("t=%llus  released set A (RT_0..RT_%u), still rendering set B\n", seconds, setACount - 1);
 }
 
 } // namespace
 
 int wmain(int argc, wchar_t** argv)
 {
-    // Arguments: <megabytes> and optionally -flip (or --flip), in either order.
+    // Arguments: <megabytes> and optionally -flip or -promote (or --flip, --promote), in either order.
     const wchar_t* sizeArg = nullptr;
     int sizeArgCount = 0;
     for (int i = 1; i < argc; ++i)
     {
         if (wcscmp(argv[i], L"-flip") == 0 || wcscmp(argv[i], L"--flip") == 0)
             g_flip = true;
+        else if (wcscmp(argv[i], L"-promote") == 0 || wcscmp(argv[i], L"--promote") == 0)
+            g_promote = true;
         else
             sizeArg = argv[i], ++sizeArgCount;
     }
     wchar_t* end = nullptr;
     const unsigned long megabytes = sizeArgCount == 1 ? wcstoul(sizeArg, &end, 10) : 0;
-    if (megabytes < kRtMegabytes || *end != L'\0')
+    if (megabytes < kRtMegabytes || *end != L'\0' || (g_flip && g_promote))
     {
-        printf("Usage: vramtiming <megabytes> [-flip]\n"
+        printf("Usage: vramtiming <megabytes> [-flip | -promote]\n"
                "  Allocates <megabytes>/16 render targets of 16 MiB, renders all of them every frame and\n"
                "  prints once per second how many are in video memory (fast) vs system memory (slow).\n"
-               "  -flip: allocates two such sets (A and B), renders only one of them and switches to the\n"
-               "         other every 10 s.\n"
+               "  -flip: renders that set (A) for 60 s, then allocates a second such set (B) and renders\n"
+               "         only B for 60 s, then renders A again and releases B, until closed.\n"
+               "  -promote: renders set A for 10 s, then allocates set B and renders only B; at 20 s\n"
+               "         releases A and keeps rendering B, until closed.\n"
                "  Example: vramtiming 8192\n");
         return 1;
     }
@@ -379,31 +425,36 @@ int wmain(int argc, wchar_t** argv)
     Sleep(2000);
 
     wchar_t title[64];
-    swprintf_s(title, g_flip ? L"vramtiming 2 x %lu MB -flip" : L"vramtiming %lu MB", megabytes);
+    swprintf_s(title, g_flip ? L"vramtiming %lu MB -flip" : g_promote ? L"vramtiming %lu MB -promote" : L"vramtiming %lu MB",
+        megabytes);
     HWND window = CreateAppWindow(title, kWindowSize, kWindowSize);
     CreateGpu(g_gpu, window, kWindowSize, kWindowSize);
     printf("vramtiming pid %lu | adapter %ls, %llu MB dedicated video memory\n", GetCurrentProcessId(),
         g_gpu.adapterDesc.Description, (unsigned long long)(g_gpu.adapterDesc.DedicatedVideoMemory >> 20));
 
-    const UINT setSize = megabytes / kRtMegabytes;
-    CreateRenderTargets(g_flip ? 2 * setSize : setSize);
-    g_activeCount = g_flip ? RtCount() / 2 : RtCount();
+    g_setSize = megabytes / kRtMegabytes;
+    CreateDescriptorHeaps();
+    g_activeCount = CreateRenderTargets(g_setSize); // set A with -flip/-promote
     if (g_activeCount == 0)
-        CheckHr(E_OUTOFMEMORY, "creating at least one render target per set");
-    if (g_flip && g_activeCount < setSize)
-        printf("-flip: out of memory, splitting the %u render targets created into two sets of %u\n", RtCount(), g_activeCount);
+        CheckHr(E_OUTOFMEMORY, "creating any render target");
     CreatePipelines();
     CreateTimestampQueries();
     if (g_flip)
-        printf("rendering set A (RT_0 .. RT_%u) or set B (RT_%u .. RT_%u), %u MB each, switching every %llu s; close the window to exit\n",
-            g_activeCount - 1, g_activeCount, 2 * g_activeCount - 1, g_activeCount * kRtMegabytes, kFlipSeconds);
+        printf("rendering set A (RT_0 .. RT_%u, %u MB); set B is allocated and rendered instead from %llu s, "
+               "released at %llu s; close the window to exit\n",
+            RtCount() - 1, RtCount() * kRtMegabytes, kFlipSeconds, 2 * kFlipSeconds);
+    else if (g_promote)
+        printf("rendering set A (RT_0 .. RT_%u, %u MB); set B is allocated and rendered instead from %llu s, "
+               "set A released at %llu s; close the window to exit\n",
+            RtCount() - 1, RtCount() * kRtMegabytes, kPromoteSeconds, 2 * kPromoteSeconds);
     else
         printf("rendering %u render targets (RT_0 .. RT_%u, %u MB) every frame; close the window to exit\n",
             RtCount(), RtCount() - 1, RtCount() * kRtMegabytes);
 
     const ULONGLONG start = GetTickCount64();
     ULONGLONG lastReport = 0;
-    ULONGLONG nextFlip = kFlipSeconds;
+    const ULONGLONG phaseSeconds = g_flip ? kFlipSeconds : kPromoteSeconds;
+    ULONGLONG nextFlip = TwoSets() ? phaseSeconds : ULLONG_MAX; // -flip/-promote: when the next transition is due
     while (PumpMessages())
     {
         RenderChain();
@@ -415,10 +466,15 @@ int wmain(int argc, wchar_t** argv)
         {
             lastReport = seconds;
             PrintReport(seconds);
-            if (g_flip && seconds >= nextFlip)
+            if (seconds >= nextFlip && nextFlip == phaseSeconds)
+                nextFlip = AllocateSetB(seconds) ? 2 * phaseSeconds : ULLONG_MAX;
+            else if (seconds >= nextFlip)
             {
-                Flip(seconds);
-                nextFlip = (seconds / kFlipSeconds + 1) * kFlipSeconds;
+                if (g_promote)
+                    ReleaseSetA(seconds); // set B until the window is closed
+                else
+                    ReleaseSetB(seconds); // set A until the window is closed
+                nextFlip = ULLONG_MAX; // no more transitions
             }
         }
     }
