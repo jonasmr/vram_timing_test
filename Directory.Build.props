@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Auto-imported by MSBuild for the project in this folder. Also stops MSBuild
+  from picking up any Directory.Build.props further up the tree.
+  All build output goes to build\ next to this file.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <VramTimingBuildDir>$(MSBuildThisFileDirectory)build\</VramTimingBuildDir>
+    <BaseIntermediateOutputPath>$(VramTimingBuildDir)obj\</BaseIntermediateOutputPath>
+    <OutDir>$(VramTimingBuildDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(VramTimingBuildDir)obj\$(Configuration)\</IntDir>
+    <!-- No vcpkg involvement (an enclosing repository may contain a vcpkg manifest). -->
+    <VcpkgEnabled>false</VcpkgEnabled>
+    <VcpkgEnableManifest>false</VcpkgEnableManifest>
+  </PropertyGroup>
+</Project>
