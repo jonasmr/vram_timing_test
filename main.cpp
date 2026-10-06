@@ -49,13 +49,14 @@ constexpr unsigned long kMaxBlockMegabytes = 1 << 20; // 1 TiB, just to reject n
 // ---- Test state ----
 
 // A block of render targets from the command line. Each block owns a fixed range of render target
-// indices, in command line order: A = RT_0 .. RT_<a-1>, B the next ones, and so on. A dynamic block
-// uses the same range (so the same names, descriptors and queries) every time it is allocated.
+// indices, in command line order: A = A_0 .. A_<a-1>, B = B_<a> .., and so on. The render targets are
+// named <block letter>_<index>. A dynamic block uses the same range (so the same names, descriptors
+// and queries) every time it is allocated.
 struct Block
 {
     char name;      // 'A', 'B', ...
     UINT megabytes; // size from the command line, before rounding up
-    UINT first;     // its render targets are RT_<first> .. RT_<first + count - 1>
+    UINT first;     // its render targets are <name>_<first> .. <name>_<first + count - 1>
     UINT count;     // render targets it should have: its size rounded up to whole 16 MiB
     bool dynamic;   // allocated only while it is the active block
     UINT allocated; // render targets that exist right now: 0 while freed, count, or fewer if out of memory
@@ -163,8 +164,8 @@ void CreateDescriptorHeaps()
 }
 
 // Creates the block's render targets: committed 16 MiB render targets in the DEFAULT heap, named
-// RT_<index>, with their RTV and SRV. If the device runs out of memory, it stops there and says so
-// (and exits if it could not create a single one).
+// <block letter>_<index>, with their RTV and SRV. If the device runs out of memory, it stops there
+// and says so (and exits if it could not create a single one).
 void CreateBlock(Block& block)
 {
     D3D12_HEAP_PROPERTIES heap{ D3D12_HEAP_TYPE_DEFAULT };
@@ -192,7 +193,7 @@ void CreateBlock(Block& block)
             return;
         }
         wchar_t name[32];
-        swprintf_s(name, L"RT_%u", index);
+        swprintf_s(name, L"%c_%u", wchar_t(block.name), index);
         g_rts[index]->SetName(name);
         g_gpu.device->CreateRenderTargetView(g_rts[index].Get(), nullptr, g_rtvs.Cpu(index));
         g_gpu.device->CreateShaderResourceView(g_rts[index].Get(), nullptr, g_srvs.Cpu(index));
@@ -397,8 +398,8 @@ void PrintReport(ULONGLONG seconds)
         sprintf_s(evicted, "%lluMB", (unsigned long long)(demotedBytes >> 20));
 
     // Worst case (5-digit seconds, RT indices and MB, 6-digit alloc MB, 4-digit frame ms) is ~150 chars.
-    Log("t=%llus  block %c RT_%u..%u | alloc %u MB | vram(fast) %uMB/%u | sys(slow) %uMB/%u | evicted(kernel) %s | frame %.1f ms",
-        seconds, Active().name, Active().first, ActiveLast(), AllocatedMegabytes(), fastCount * kRtMegabytes, fastCount,
+    Log("t=%llus  block %c %c_%u..%u | alloc %u MB | vram(fast) %uMB/%u | sys(slow) %uMB/%u | evicted(kernel) %s | frame %.1f ms",
+        seconds, Active().name, Active().name, Active().first, ActiveLast(), AllocatedMegabytes(), fastCount * kRtMegabytes, fastCount,
         slowCount * kRtMegabytes, slowCount, evicted, Median(g_frameMs));
     ClearSamples();
 }
@@ -421,7 +422,7 @@ void NextBlock(ULONGLONG seconds)
     char freed[64] = "";
     if (Active().dynamic)
     {
-        sprintf_s(freed, "freed block %c RT_%u..%u (%u MB) ", Active().name, Active().first, ActiveLast(),
+        sprintf_s(freed, "freed block %c %c_%u..%u (%u MB) ", Active().name, Active().name, Active().first, ActiveLast(),
             Active().allocated * kRtMegabytes);
         FreeBlock(Active());
     }
@@ -429,8 +430,8 @@ void NextBlock(ULONGLONG seconds)
     if (Active().dynamic)
         CreateBlock(Active());
     ClearSamples();
-    Log("t=%llus  %s-> block %c RT_%u..%u (%u MB%s)", seconds, freed, Active().name, Active().first, ActiveLast(),
-        Active().allocated * kRtMegabytes, Active().dynamic ? ", allocated now" : "");
+    Log("t=%llus  %s-> block %c %c_%u..%u (%u MB%s)", seconds, freed, Active().name, Active().name, Active().first,
+        ActiveLast(), Active().allocated * kRtMegabytes, Active().dynamic ? ", allocated now" : "");
 }
 
 } // namespace

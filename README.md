@@ -8,8 +8,8 @@ demoted bytes next to that, so the two can be compared.
 
 1. The command line defines one or more **blocks** of render targets, named `A`, `B`, `C`, ... Each
    render target is exactly 16 MiB (2048x2048 `R8G8B8A8_UNORM`, a committed resource in the DEFAULT
-   heap), named `RT_<index>` with `SetName`. The indices run on over all blocks: `A` is `RT_0` ..
-   `RT_<a-1>`, `B` the next ones, and so on.
+   heap), named `<block letter>_<index>` with `SetName`. The indices run on over all blocks: `A` is
+   `A_0` .. `A_<a-1>`, `B` is `B_<a>` .., and so on.
 2. The blocks are rendered one at a time, in order, each for the given number of seconds. Every frame
    it draws all render targets of the active block, as a chain: the first one is noise from a new
    random seed, each next one is noise mixed with the previous one. So every render target of the
@@ -95,14 +95,14 @@ from. Instead:
 ```
 blocks: A 32 MB, B 128 MB dynamic | 3 s each | -flip: loop
 allocated 32 MB at startup, rendering block A; close the window or press Esc to exit
-t=1s  block A RT_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
+t=1s  block A A_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
 ...
-t=3s  block A RT_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
-t=3s  -> block B RT_2..9 (128 MB, allocated now)
-t=4s  block B RT_2..9 | alloc 160 MB | vram(fast) 128MB/8 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.8 ms
+t=3s  block A A_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
+t=3s  -> block B B_2..9 (128 MB, allocated now)
+t=4s  block B B_2..9 | alloc 160 MB | vram(fast) 128MB/8 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.8 ms
 ...
-t=6s  freed block B RT_2..9 (128 MB) -> block A RT_0..1 (32 MB)
-t=7s  block A RT_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
+t=6s  freed block B B_2..9 (128 MB) -> block A A_0..1 (32 MB)
+t=7s  block A A_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
 ```
 
 MB means MiB here.
@@ -110,7 +110,7 @@ MB means MiB here.
 | Field | Meaning |
 |---|---|
 | `t=4s` | seconds since rendering started |
-| `block B RT_2..9` | the active block, rendered and measured during the last second, and its render targets |
+| `block B B_2..9` | the active block, rendered and measured during the last second, and its render targets |
 | `alloc 160 MB` | total size of all render targets allocated right now, over all blocks |
 | `vram(fast) 128MB/8` | render targets of the active block whose draws were fast during the last second, i.e. in video memory: their total size / their count |
 | `sys(slow) 0MB/0` | render targets of the active block whose draws were slow during the last second, i.e. in system memory: their total size / their count |
@@ -147,13 +147,13 @@ run of `vramtiming 10 6144d 6144` on an RTX 3060 (12 GB):
 ```
 blocks: A 6144 MB dynamic, B 6144 MB | 10 s each | then stays on the last block
 allocated 12288 MB at startup, rendering block A; close the window or press Esc to exit
-t=10s  block A RT_0..383 | alloc 12288 MB | vram(fast) 5936MB/371 | sys(slow) 208MB/13 | evicted(kernel) 3712MB | frame 71.5 ms
-t=10s  freed block A RT_0..383 (6144 MB) -> block B RT_384..767 (6144 MB)
-t=11s  block B RT_384..767 | alloc 6144 MB | vram(fast) 2240MB/140 | sys(slow) 3904MB/244 | evicted(kernel) 3104MB | frame 1296.2 ms
-t=13s  block B RT_384..767 | alloc 6144 MB | vram(fast) 2896MB/181 | sys(slow) 3248MB/203 | evicted(kernel) 2464MB | frame 512.3 ms
-t=16s  block B RT_384..767 | alloc 6144 MB | vram(fast) 4064MB/254 | sys(slow) 2080MB/130 | evicted(kernel) 1216MB | frame 355.0 ms
-t=19s  block B RT_384..767 | alloc 6144 MB | vram(fast) 5696MB/356 | sys(slow) 448MB/28 | evicted(kernel) 96MB | frame 93.2 ms
-t=22s  block B RT_384..767 | alloc 6144 MB | vram(fast) 6144MB/384 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 40.5 ms
+t=10s  block A A_0..383 | alloc 12288 MB | vram(fast) 5936MB/371 | sys(slow) 208MB/13 | evicted(kernel) 3712MB | frame 71.5 ms
+t=10s  freed block A A_0..383 (6144 MB) -> block B B_384..767 (6144 MB)
+t=11s  block B B_384..767 | alloc 6144 MB | vram(fast) 2240MB/140 | sys(slow) 3904MB/244 | evicted(kernel) 3104MB | frame 1296.2 ms
+t=13s  block B B_384..767 | alloc 6144 MB | vram(fast) 2896MB/181 | sys(slow) 3248MB/203 | evicted(kernel) 2464MB | frame 512.3 ms
+t=16s  block B B_384..767 | alloc 6144 MB | vram(fast) 4064MB/254 | sys(slow) 2080MB/130 | evicted(kernel) 1216MB | frame 355.0 ms
+t=19s  block B B_384..767 | alloc 6144 MB | vram(fast) 5696MB/356 | sys(slow) 448MB/28 | evicted(kernel) 96MB | frame 93.2 ms
+t=22s  block B B_384..767 | alloc 6144 MB | vram(fast) 6144MB/384 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 40.5 ms
 ```
 
 In this run the kernel promoted block B gradually, about 400 MB per second, starting right after block
