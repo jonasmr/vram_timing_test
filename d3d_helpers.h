@@ -1,4 +1,4 @@
-// d3d_helpers: the D3D12 / Win32 boilerplate of vramtiming (window, device, swap chain, descriptor
+// d3d_helpers: the D3D12 / Win32 boilerplate of vramtiming (log, window, device, swap chain, descriptor
 // heaps, shaders, pipelines). Nothing in here is specific to the test; main.cpp holds the test itself.
 
 #pragma once
@@ -10,16 +10,35 @@
 
 using Microsoft::WRL::ComPtr;
 
-// Prints the failing expression and HRESULT, then exits the process.
+// ---- Log ----
+
+// Opens the log file vramtiming.log in the current directory (overwritten) and logs its full path as the
+// first line. With console = true it also opens a console window for the process and logs to it, too.
+void StartLog(bool console);
+
+// Logs one line (printf format, no trailing newline needed) to the log file, flushed right away, and to
+// the console if there is one.
+void Log(const char* format, ...);
+
+// Logs "FATAL: <message>", shows the message in a message box, then exits the process with code 2.
+[[noreturn]] void Fatal(const char* format, ...);
+
+// If hr is a failure: Fatal() with the failing expression and the HRESULT.
 void CheckHr(HRESULT hr, const char* what);
 #define CHECK(x) CheckHr((x), #x)
 
 // ---- Window ----
 
+// Both window functions expect per-monitor DPI awareness, so sizes are physical pixels.
+
 // Creates a visible, non-resizable window whose client area is exactly width x height pixels.
 HWND CreateAppWindow(const wchar_t* title, UINT width, UINT height);
 
-// Handles pending window messages. Returns false once the window has been closed.
+// Creates a visible borderless window (WS_POPUP) that covers exactly the given desktop rectangle.
+HWND CreateFullscreenWindow(const wchar_t* title, const RECT& rect);
+
+// Handles pending window messages. Returns false once the window has been closed: by Esc, Alt+F4, the
+// close button or WM_CLOSE.
 bool PumpMessages();
 
 // ---- Device, queue, swap chain ----
@@ -39,10 +58,13 @@ constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
 struct Gpu
 {
+    ComPtr<IDXGIFactory6> factory;
+    ComPtr<IDXGIAdapter1> adapter;
     DXGI_ADAPTER_DESC1 adapterDesc{};
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<IDXGISwapChain3> swapChain;
+    UINT width = 0, height = 0; // back buffer size
     ComPtr<ID3D12Resource> backBuffers[kBackBufferCount];
     DescriptorHeap backBufferRtvs;
     ComPtr<ID3D12Fence> fence;
@@ -50,9 +72,16 @@ struct Gpu
     HANDLE fenceEvent = nullptr;
 };
 
-// Picks the high-performance hardware adapter and creates device, direct queue, fence and a
-// flip-model swap chain of width x height for the window.
-void CreateGpu(Gpu& gpu, HWND window, UINT width, UINT height);
+// Picks the high-performance hardware adapter and creates device, direct queue and fence.
+void CreateGpu(Gpu& gpu);
+
+// Desktop rectangle of the adapter's first output (monitor), in physical pixels. If the adapter has no
+// outputs (e.g. the discrete GPU of a hybrid laptop), the primary monitor's. Logs which one and its size.
+RECT AdapterDesktopRect(const Gpu& gpu);
+
+// Creates a flip-model (flip discard) swap chain for the window, with back buffers the size of its
+// client area. Never exclusive fullscreen.
+void CreateSwapChain(Gpu& gpu, HWND window);
 
 // Signals the fence on the queue and blocks until the GPU has reached it (exits if the device is removed).
 void WaitForGpu(Gpu& gpu);

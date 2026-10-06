@@ -1,6 +1,6 @@
 // vramtiming: ground-truth test for GPU memory demotion.
 //
-// Usage: vramtiming <seconds> <size>[d] [<size>[d] ...] [-flip]
+// Usage: vramtiming <seconds> <size>[d] [<size>[d] ...] [-flip] [-fullscreen]
 //
 // Each <size> (in MB) defines a block of render targets of 16 MiB each; the blocks are named A, B, C, ...
 // in order. The blocks are rendered one at a time, each for <seconds>, and every frame draws ALL render
@@ -13,7 +13,11 @@
 // A block is allocated at startup and kept until exit, unless its size ends in 'd' (dynamic): a dynamic
 // block exists only while it is the active block. It is allocated when it becomes active and freed when
 // the next block becomes active. After the last block it stays on the last block, or with -flip starts
-// over at A, until the window is closed.
+// over at A, until the window is closed (or Esc is pressed).
+//
+// It is a Windows (GUI) program, not a console program, so that Windows treats it like a game. All output
+// goes to vramtiming.log in the current directory and, unless -fullscreen, to a console window it opens.
+// With -fullscreen the window is borderless and covers the monitor of the adapter's first output.
 //
 // "MB" in the output means MiB (1024 * 1024 bytes).
 
@@ -50,6 +54,7 @@ constexpr unsigned long kMaxBlockMegabytes = 1 << 20; // 1 TiB, just to reject n
 struct Block
 {
     char name;      // 'A', 'B', ...
+    UINT megabytes; // size from the command line, before rounding up
     UINT first;     // its render targets are RT_<first> .. RT_<first + count - 1>
     UINT count;     // render targets it should have: its size rounded up to whole 16 MiB
     bool dynamic;   // allocated only while it is the active block
@@ -61,6 +66,7 @@ std::vector<Block> g_blocks;
 UINT g_active = 0;            // index of the block that is rendered and measured
 ULONGLONG g_blockSeconds = 0; // how long each block is active
 bool g_flip = false;          // after the last block, start over at A (otherwise stay on the last block)
+bool g_fullscreen = false;    // borderless window over the whole monitor, log only to the file
 
 std::vector<ComPtr<ID3D12Resource>> g_rts; // RT i, for all blocks; null while its block is not allocated
 DescriptorHeap g_rtvs;                     // RTV i = RT i
@@ -92,30 +98,33 @@ UINT AllocatedMegabytes()
 
 // ---- Command line ----
 
-void PrintUsage()
-{
-    printf("Usage: vramtiming <seconds> <size>[d] [<size>[d] ...] [-flip]\n"
-           "  Each <size> (MB) defines a block of 16 MiB render targets, named A, B, C, ... in order.\n"
-           "  The blocks are rendered in order, <seconds> each: every frame draws all render targets of the\n"
-           "  active block, and once per second it prints how many are in video memory (fast) and how many\n"
-           "  in system memory (slow). Blocks are allocated at startup and kept, except a block whose size\n"
-           "  ends in d (dynamic): it is allocated when it becomes active and freed when the next one does.\n"
-           "  After the last block it stays there; with -flip it starts over at A. Close the window to exit.\n"
-           "  Examples:\n"
-           "    vramtiming 15 512 512 512    A, B, C (all allocated at startup) 15 s each, then stays on C\n"
-           "    vramtiming 20 32 128d -flip  A; at 20 s allocate B and render it; at 40 s free B, back to A; loop\n"
-           "    vramtiming 10 8192           one block of 8192 MB\n"
-           "    vramtiming 10 3072d 3072     A and B exist at startup; at 10 s free A and render B forever\n");
-}
+const char* kUsage =
+    "Usage: vramtiming <seconds> <size>[d] [<size>[d] ...] [-flip] [-fullscreen]\n"
+    "  Each <size> (MB) defines a block of 16 MiB render targets, named A, B, C, ... in order.\n"
+    "  The blocks are rendered in order, <seconds> each: every frame draws all render targets of the\n"
+    "  active block, and once per second it logs how many are in video memory (fast) and how many\n"
+    "  in system memory (slow). Blocks are allocated at startup and kept, except a block whose size\n"
+    "  ends in d (dynamic): it is allocated when it becomes active and freed when the next one does.\n"
+    "  After the last block it stays there; with -flip it starts over at A.\n"
+    "  -fullscreen: borderless window covering the whole monitor (otherwise a 1024x1024 window).\n"
+    "  The log goes to vramtiming.log in the current directory, and without -fullscreen also to a\n"
+    "  console window. Close the window or press Esc to exit.\n"
+    "  Examples:\n"
+    "    vramtiming 15 512 512 512    A, B, C (all allocated at startup) 15 s each, then stays on C\n"
+    "    vramtiming 20 32 128d -flip  A; at 20 s allocate B and render it; at 40 s free B, back to A; loop\n"
+    "    vramtiming 10 8192           one block of 8192 MB\n"
+    "    vramtiming 10 3072d 3072     A and B exist at startup; at 10 s free A and render B forever";
 
-// Fills g_blockSeconds, g_blocks and g_flip from the command line. Returns false if it is invalid.
+// Fills g_blockSeconds, g_blocks, g_flip and g_fullscreen from the command line. Returns false if it is invalid.
 bool ParseArguments(int argc, wchar_t** argv)
 {
-    std::vector<const wchar_t*> numbers; // everything except -flip: <seconds>, then the sizes
+    std::vector<const wchar_t*> numbers; // everything except the flags: <seconds>, then the sizes
     for (int i = 1; i < argc; ++i)
     {
         if (wcscmp(argv[i], L"-flip") == 0 || wcscmp(argv[i], L"--flip") == 0)
             g_flip = true;
+        else if (wcscmp(argv[i], L"-fullscreen") == 0 || wcscmp(argv[i], L"--fullscreen") == 0)
+            g_fullscreen = true;
         else if (iswdigit(argv[i][0]))
             numbers.push_back(argv[i]);
         else
@@ -137,11 +146,8 @@ bool ParseArguments(int argc, wchar_t** argv)
         if (megabytes > kMaxBlockMegabytes || end[dynamic ? 1 : 0] != L'\0')
             return false;
         const UINT count = std::max(1u, UINT(megabytes + kRtMegabytes - 1) / kRtMegabytes);
-        g_blocks.push_back({ char('A' + i - 1), first, count, dynamic, 0 });
+        g_blocks.push_back({ char('A' + i - 1), UINT(megabytes), first, count, dynamic, 0 });
         first += count;
-        if (count * kRtMegabytes != megabytes)
-            printf("block %c: %lu MB rounded up to %u MB (whole 16 MiB render targets)\n",
-                g_blocks.back().name, megabytes, count * kRtMegabytes);
     }
     return true;
 }
@@ -179,8 +185,8 @@ void CreateBlock(Block& block)
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g_rts[index]));
         if (FAILED(hr))
         {
-            printf("CreateCommittedResource failed (hr=0x%08X) after %u of %u render targets of block %c, "
-                   "continuing with %u\n", (unsigned)hr, block.allocated, block.count, block.name, block.allocated);
+            Log("CreateCommittedResource failed (hr=0x%08X) after %u of %u render targets of block %c, "
+                "continuing with %u", (unsigned)hr, block.allocated, block.count, block.name, block.allocated);
             if (block.allocated == 0)
                 CheckHr(hr, "creating any render target of the block");
             return;
@@ -236,16 +242,16 @@ void CreateTimestampQueries()
 
 // ---- Frame ----
 
-// Sets the state shared by all fullscreen passes into a size x size render target.
-void BeginPass(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pipeline, UINT size)
+// Sets the state shared by all fullscreen passes into a width x height render target.
+void BeginPass(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pipeline, UINT width, UINT height)
 {
     ID3D12DescriptorHeap* heaps[] = { g_srvs.heap.Get() };
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetGraphicsRootSignature(g_rootSignature.Get());
     cl->SetPipelineState(pipeline);
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    const D3D12_VIEWPORT viewport{ 0, 0, (float)size, (float)size, 0, 1 };
-    const D3D12_RECT scissor{ 0, 0, (LONG)size, (LONG)size };
+    const D3D12_VIEWPORT viewport{ 0, 0, (float)width, (float)height, 0, 1 };
+    const D3D12_RECT scissor{ 0, 0, (LONG)width, (LONG)height };
     cl->RSSetViewports(1, &viewport);
     cl->RSSetScissorRects(1, &scissor);
 }
@@ -283,7 +289,7 @@ void RenderChain()
     for (UINT first = begin; first < end; first += kDrawsPerCommandList)
     {
         ID3D12GraphicsCommandList* cl = BeginCommandList(g_chainLists[(first - begin) / kDrawsPerCommandList]);
-        BeginPass(cl, g_chainPipeline.Get(), kRtSize);
+        BeginPass(cl, g_chainPipeline.Get(), kRtSize, kRtSize);
         const UINT last = std::min(end, first + kDrawsPerCommandList);
         for (UINT i = first; i < last; ++i)
             DrawChainLink(cl, i, seed);
@@ -296,14 +302,15 @@ void RenderChain()
     g_gpu.queue->ExecuteCommandLists((UINT)lists.size(), lists.data());
 }
 
-// Draws the last render target of the active block into the window, so you can see the test is alive.
+// Draws the last render target of the active block into the window, stretched to the whole back buffer,
+// so you can see the test is alive.
 void ShowLastRT()
 {
     ID3D12Resource* backBuffer = g_gpu.backBuffers[g_gpu.swapChain->GetCurrentBackBufferIndex()].Get();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_gpu.backBufferRtvs.Cpu(g_gpu.swapChain->GetCurrentBackBufferIndex());
 
     ID3D12GraphicsCommandList* cl = BeginCommandList(g_showList);
-    BeginPass(cl, g_showPipeline.Get(), kWindowSize);
+    BeginPass(cl, g_showPipeline.Get(), g_gpu.width, g_gpu.height);
     const UINT unusedConstants[2] = {};
     cl->SetGraphicsRoot32BitConstants(0, 2, unusedConstants, 0);
     cl->SetGraphicsRootDescriptorTable(1, g_srvs.Gpu(ActiveLast()));
@@ -390,7 +397,7 @@ void PrintReport(ULONGLONG seconds)
         sprintf_s(evicted, "%lluMB", (unsigned long long)(demotedBytes >> 20));
 
     // Worst case (5-digit seconds, RT indices and MB, 6-digit alloc MB, 4-digit frame ms) is ~150 chars.
-    printf("t=%llus  block %c RT_%u..%u | alloc %u MB | vram(fast) %uMB/%u | sys(slow) %uMB/%u | evicted(kernel) %s | frame %.1f ms\n",
+    Log("t=%llus  block %c RT_%u..%u | alloc %u MB | vram(fast) %uMB/%u | sys(slow) %uMB/%u | evicted(kernel) %s | frame %.1f ms",
         seconds, Active().name, Active().first, ActiveLast(), AllocatedMegabytes(), fastCount * kRtMegabytes, fastCount,
         slowCount * kRtMegabytes, slowCount, evicted, Median(g_frameMs));
     ClearSamples();
@@ -422,38 +429,59 @@ void NextBlock(ULONGLONG seconds)
     if (Active().dynamic)
         CreateBlock(Active());
     ClearSamples();
-    printf("t=%llus  %s-> block %c RT_%u..%u (%u MB%s)\n", seconds, freed, Active().name, Active().first, ActiveLast(),
+    Log("t=%llus  %s-> block %c RT_%u..%u (%u MB%s)", seconds, freed, Active().name, Active().first, ActiveLast(),
         Active().allocated * kRtMegabytes, Active().dynamic ? ", allocated now" : "");
 }
 
 } // namespace
 
-int wmain(int argc, wchar_t** argv)
+// A Windows (GUI) program: wWinMain instead of main, the command line comes from __argc / __wargv.
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
-    setvbuf(stdout, nullptr, _IONBF, 0); // every line appears immediately, also when redirected to a file
+    const int argc = __argc;
+    wchar_t** argv = __wargv;
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); // sizes in physical pixels at any display scaling
+
     if (!ParseArguments(argc, argv))
     {
-        PrintUsage();
+        StartLog(false);
+        Log("%s", kUsage);
+        MessageBoxA(nullptr, (std::string("Invalid command line.\n\n") + kUsage).c_str(), "vramtiming", MB_OK | MB_ICONWARNING);
         return 1;
     }
+    // Fullscreen covers the screen, so a console would only be in the way: then the log goes only to the file.
+    StartLog(!g_fullscreen);
+    for (const Block& block : g_blocks)
+        if (block.count * kRtMegabytes != block.megabytes)
+            Log("block %c: %u MB rounded up to %u MB (whole 16 MiB render targets)", block.name, block.megabytes,
+                block.count * kRtMegabytes);
 
     // Give a separately started ETW monitor (e.g. dxtcl_monitor) time to start its session before the device and resources exist.
-    printf("waiting 2 s so an ETW monitor can attach...\n");
+    Log("waiting 2 s so an ETW monitor can attach...");
     Sleep(2000);
 
+    CreateGpu(g_gpu);
     std::wstring title = L"vramtiming";
     for (int i = 1; i < argc; ++i)
         title += std::wstring(L" ") + argv[i];
-    HWND window = CreateAppWindow(title.c_str(), kWindowSize, kWindowSize);
-    CreateGpu(g_gpu, window, kWindowSize, kWindowSize);
-    printf("vramtiming pid %lu | adapter %ls, %llu MB dedicated video memory\n", GetCurrentProcessId(),
+    HWND window = nullptr;
+    if (g_fullscreen)
+        window = CreateFullscreenWindow(title.c_str(), AdapterDesktopRect(g_gpu));
+    else
+        window = CreateAppWindow(title.c_str(), kWindowSize, kWindowSize);
+    CreateSwapChain(g_gpu, window);
+    Log("vramtiming pid %lu | adapter %ls, %llu MB dedicated video memory", GetCurrentProcessId(),
         g_gpu.adapterDesc.Description, (unsigned long long)(g_gpu.adapterDesc.DedicatedVideoMemory >> 20));
 
-    printf("blocks:");
+    std::string blocks = "blocks:";
     for (const Block& block : g_blocks)
-        printf("%s %c %u MB%s", &block == &g_blocks[0] ? "" : ",", block.name, block.count * kRtMegabytes,
+    {
+        char text[64];
+        sprintf_s(text, "%s %c %u MB%s", &block == &g_blocks[0] ? "" : ",", block.name, block.count * kRtMegabytes,
             block.dynamic ? " dynamic" : "");
-    printf(" | %llu s each | %s\n", g_blockSeconds, g_flip ? "-flip: loop" : "then stays on the last block");
+        blocks += text;
+    }
+    Log("%s | %llu s each | %s", blocks.c_str(), g_blockSeconds, g_flip ? "-flip: loop" : "then stays on the last block");
 
     // Allocate the persistent blocks, in order, and block A, which is active first, even if it is dynamic.
     g_rts.resize(RtCount());
@@ -463,7 +491,7 @@ int wmain(int argc, wchar_t** argv)
             CreateBlock(block);
     CreatePipelines();
     CreateTimestampQueries();
-    printf("allocated %u MB at startup, rendering block A; close the window to exit\n", AllocatedMegabytes());
+    Log("allocated %u MB at startup, rendering block A; close the window or press Esc to exit", AllocatedMegabytes());
 
     const ULONGLONG start = GetTickCount64();
     ULONGLONG lastReport = 0;
@@ -488,6 +516,6 @@ int wmain(int argc, wchar_t** argv)
     }
 
     WaitForGpu(g_gpu);
-    printf("window closed, exiting\n");
+    Log("window closed, exiting");
     return 0;
 }

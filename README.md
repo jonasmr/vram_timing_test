@@ -16,12 +16,12 @@ demoted bytes next to that, so the two can be compared.
    active block is read and written every frame.
 3. Each render target's draw is bracketed by GPU timestamps. A render target in video memory takes
    roughly 0.05-0.1 ms, one in system memory (accessed over PCIe) more than 1 ms.
-4. The window (1024x1024) shows the last render target of the active block, so you can see it is
-   running.
-5. Once per second it prints exactly one line to the console (see below), plus one line whenever the
-   active block changes.
+4. The window (1024x1024, or the whole monitor with `-fullscreen`) shows the last render target of the
+   active block, so you can see it is running.
+5. Once per second it logs exactly one line (see below), plus one line whenever the active block
+   changes.
 
-It runs until the window is closed.
+It runs until the window is closed or Esc is pressed.
 
 ## Build
 
@@ -37,7 +37,7 @@ The executable is written to `build\bin\Release\vramtiming.exe`.
 ## Run
 
 ```
-vramtiming.exe <seconds> <size>[d] [<size>[d] ...] [-flip]
+vramtiming.exe <seconds> <size>[d] [<size>[d] ...] [-flip] [-fullscreen]
 ```
 
 - `<seconds>`: how long each block is active.
@@ -50,7 +50,15 @@ vramtiming.exe <seconds> <size>[d] [<size>[d] ...] [-flip]
   active first, so it is allocated at startup even if it is dynamic.
 - After the last block it stays on the last block. With `-flip` (anywhere on the command line) it
   starts over at `A` instead, forever.
+- `-fullscreen` (anywhere on the command line): instead of the 1024x1024 window, a borderless window
+  that covers exactly the monitor of the adapter's first output (`IDXGIAdapter::EnumOutputs(0)`,
+  `DesktopCoordinates`), with a swap chain at that monitor's current resolution. It is still a normal
+  flip-model (flip discard) swap chain, not exclusive fullscreen. If the adapter has no outputs (e.g.
+  the discrete GPU of a hybrid laptop) it uses the primary monitor and logs that. The render target is
+  stretched to the whole screen.
 - If allocating runs out of memory, it continues with the render targets that were created and says so.
+- To exit, close the window (Alt+F4 or the close button) or press Esc (the fullscreen window has no
+  title bar).
 
 Examples:
 
@@ -64,11 +72,29 @@ Examples:
 At startup it waits 2 seconds before creating the D3D12 device, so that an ETW monitor started
 separately (such as `dxtcl_monitor`) has its session running before any D3D12 object is created.
 
+### Log file and console
+
+vramtiming is a Windows (GUI) program (`/SUBSYSTEM:WINDOWS`, `wWinMain`), not a console program, so
+that Windows treats it like a real game: a GUI process whose own D3D window is the foreground window,
+not a console process. The OS's scheduling and video memory decisions should then be the same as for
+the games this test stands in for. As a GUI program it does not write to the console it was started
+from. Instead:
+
+- Everything goes to `vramtiming.log` in the current working directory, overwritten on every run. The
+  first line is the log file's full path. Each line is flushed right away, so the log is complete even
+  if the process is killed.
+- Without `-fullscreen` it also opens its own console window ("vramtiming log") and shows the same lines
+  there. That console closes when vramtiming exits; the log file stays.
+- With `-fullscreen` there is no console (it would only be in the way); read the log file.
+- On an invalid command line it writes the usage text to the log file and shows it in a message box
+  (exit code 1). A fatal error (failed D3D12 call, device removed) is logged as `FATAL: ...` and shown in
+  a message box (exit code 2).
+
 ## Reading the output
 
 ```
 blocks: A 32 MB, B 128 MB dynamic | 3 s each | -flip: loop
-allocated 32 MB at startup, rendering block A; close the window to exit
+allocated 32 MB at startup, rendering block A; close the window or press Esc to exit
 t=1s  block A RT_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
 ...
 t=3s  block A RT_0..1 | alloc 32 MB | vram(fast) 32MB/2 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 0.2 ms
@@ -120,7 +146,7 @@ run of `vramtiming 10 6144d 6144` on an RTX 3060 (12 GB):
 
 ```
 blocks: A 6144 MB dynamic, B 6144 MB | 10 s each | then stays on the last block
-allocated 12288 MB at startup, rendering block A; close the window to exit
+allocated 12288 MB at startup, rendering block A; close the window or press Esc to exit
 t=10s  block A RT_0..383 | alloc 12288 MB | vram(fast) 5936MB/371 | sys(slow) 208MB/13 | evicted(kernel) 3712MB | frame 71.5 ms
 t=10s  freed block A RT_0..383 (6144 MB) -> block B RT_384..767 (6144 MB)
 t=11s  block B RT_384..767 | alloc 6144 MB | vram(fast) 2240MB/140 | sys(slow) 3904MB/244 | evicted(kernel) 3104MB | frame 1296.2 ms
@@ -148,6 +174,6 @@ such frame times as invalid ground truth.
 |---|---|
 | `main.cpp` | the test: command line, blocks, render targets, frame loop, timing, classification, report |
 | `shaders.h` | the HLSL (fullscreen triangle, chain pass, show pass), compiled at startup |
-| `d3d_helpers.h/.cpp` | boilerplate: window, device, swap chain, descriptor heaps, shaders, pipelines |
+| `d3d_helpers.h/.cpp` | boilerplate: log, window, device, swap chain, descriptor heaps, shaders, pipelines |
 | `kernelstats.h/.cpp` | the kernel's demoted-bytes query |
 "# vram_timing_test" 

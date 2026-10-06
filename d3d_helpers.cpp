@@ -2,23 +2,96 @@
 
 #include <d3dcompiler.h>
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <share.h>
+#include <string>
+
+// ---- Log ----
+
+static FILE* g_logFile = nullptr;
+static HANDLE g_console = INVALID_HANDLE_VALUE;
+
+static std::string FormatV(const char* format, va_list args)
+{
+    va_list count;
+    va_copy(count, args);
+    const int length = _vscprintf(format, count);
+    va_end(count);
+    std::string text(length > 0 ? size_t(length) : 0, '\0');
+    vsnprintf(text.data(), text.size() + 1, format, args);
+    return text;
+}
+
+static void WriteLine(const std::string& line)
+{
+    if (g_logFile)
+    {
+        fprintf(g_logFile, "%s\n", line.c_str());
+        fflush(g_logFile); // a killed process still leaves a complete log
+    }
+    if (g_console != INVALID_HANDLE_VALUE)
+    {
+        const std::string text = line + "\n";
+        DWORD written = 0;
+        WriteConsoleA(g_console, text.data(), (DWORD)text.size(), &written, nullptr);
+    }
+}
+
+void StartLog(bool console)
+{
+    if (console)
+    {
+        AllocConsole(); // fails if the process already has a console; then that one is used
+        SetConsoleTitleW(L"vramtiming log");
+        g_console = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr);
+    }
+
+    wchar_t path[MAX_PATH] = L"vramtiming.log";
+    GetFullPathNameW(L"vramtiming.log", MAX_PATH, path, nullptr);
+    g_logFile = _wfsopen(path, L"w", _SH_DENYWR); // others can read it while it is written
+    if (!g_logFile)
+        Fatal("cannot write the log file %ls", path);
+    Log("log file %ls", path);
+}
+
+void Log(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    WriteLine(FormatV(format, args));
+    va_end(args);
+}
+
+void Fatal(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    const std::string message = FormatV(format, args);
+    va_end(args);
+    WriteLine("FATAL: " + message);
+    MessageBoxA(nullptr, message.c_str(), "vramtiming: fatal error", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    ExitProcess(2);
+}
 
 void CheckHr(HRESULT hr, const char* what)
 {
-    if (SUCCEEDED(hr))
-        return;
-    printf("FATAL: %s failed, hr=0x%08X\n", what, (unsigned)hr);
-    fflush(stdout);
-    ExitProcess(2);
+    if (FAILED(hr))
+        Fatal("%s failed, hr=0x%08X", what, (unsigned)hr);
 }
 
 // ---- Window ----
 
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE)
+    {
+        DestroyWindow(hwnd);
+        return 0;
+    }
     if (msg == WM_DESTROY)
     {
         PostQuitMessage(0);
@@ -27,11 +100,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-HWND CreateAppWindow(const wchar_t* title, UINT width, UINT height)
+static HWND CreateAndShowWindow(const wchar_t* title, DWORD style, int x, int y, int width, int height)
 {
-    // Per-monitor DPI awareness, so "width x height" means physical pixels at any display scaling.
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
     WNDCLASSEXW wc{ sizeof(wc) };
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandleW(nullptr);
@@ -39,15 +109,26 @@ HWND CreateAppWindow(const wchar_t* title, UINT width, UINT height)
     wc.lpszClassName = L"vramtiming";
     RegisterClassExW(&wc);
 
-    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX; // fixed size
-    RECT rect{ 0, 0, (LONG)width, (LONG)height };
-    AdjustWindowRectExForDpi(&rect, style, FALSE, 0, GetDpiForSystem());
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, title, style, CW_USEDEFAULT, CW_USEDEFAULT,
-        rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, wc.hInstance, nullptr);
+    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, title, style, x, y, width, height, nullptr, nullptr,
+        wc.hInstance, nullptr);
     if (!hwnd)
         CheckHr(HRESULT_FROM_WIN32(GetLastError()), "CreateWindowExW");
     ShowWindow(hwnd, SW_SHOW);
+    SetForegroundWindow(hwnd); // in front of the console window, like a game
     return hwnd;
+}
+
+HWND CreateAppWindow(const wchar_t* title, UINT width, UINT height)
+{
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX; // fixed size
+    RECT rect{ 0, 0, (LONG)width, (LONG)height };
+    AdjustWindowRectExForDpi(&rect, style, FALSE, 0, GetDpiForSystem());
+    return CreateAndShowWindow(title, style, CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top);
+}
+
+HWND CreateFullscreenWindow(const wchar_t* title, const RECT& rect)
+{
+    return CreateAndShowWindow(title, WS_POPUP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
 }
 
 bool PumpMessages()
@@ -85,7 +166,7 @@ DescriptorHeap CreateDescriptorHeap(ID3D12Device* device, D3D12_DESCRIPTOR_HEAP_
     return result;
 }
 
-void CreateGpu(Gpu& gpu, HWND window, UINT width, UINT height)
+void CreateGpu(Gpu& gpu)
 {
 #ifdef _DEBUG
     ComPtr<ID3D12Debug> debug;
@@ -93,21 +174,19 @@ void CreateGpu(Gpu& gpu, HWND window, UINT width, UINT height)
         debug->EnableDebugLayer();
 #endif
 
-    ComPtr<IDXGIFactory6> factory;
-    CHECK(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
+    CHECK(CreateDXGIFactory2(0, IID_PPV_ARGS(&gpu.factory)));
 
-    ComPtr<IDXGIAdapter1> adapter;
-    for (UINT i = 0; factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)) != DXGI_ERROR_NOT_FOUND; ++i)
+    for (UINT i = 0; gpu.factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&gpu.adapter)) != DXGI_ERROR_NOT_FOUND; ++i)
     {
-        adapter->GetDesc1(&gpu.adapterDesc);
+        gpu.adapter->GetDesc1(&gpu.adapterDesc);
         if (!(gpu.adapterDesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE))
             break;
-        adapter.Reset();
+        gpu.adapter.Reset();
     }
-    if (!adapter)
+    if (!gpu.adapter)
         CheckHr(E_FAIL, "finding a hardware adapter");
 
-    CHECK(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&gpu.device)));
+    CHECK(D3D12CreateDevice(gpu.adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&gpu.device)));
 
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -115,10 +194,40 @@ void CreateGpu(Gpu& gpu, HWND window, UINT width, UINT height)
 
     CHECK(gpu.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gpu.fence)));
     gpu.fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+}
+
+RECT AdapterDesktopRect(const Gpu& gpu)
+{
+    RECT rect{};
+    ComPtr<IDXGIOutput> output;
+    if (SUCCEEDED(gpu.adapter->EnumOutputs(0, &output)))
+    {
+        DXGI_OUTPUT_DESC desc{};
+        CHECK(output->GetDesc(&desc));
+        rect = desc.DesktopCoordinates;
+        Log("fullscreen on the adapter's first output %ls", desc.DeviceName);
+    }
+    else
+    {
+        MONITORINFO info{ sizeof(info) };
+        GetMonitorInfoW(MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY), &info);
+        rect = info.rcMonitor;
+        Log("fullscreen: the adapter has no outputs (e.g. the discrete GPU of a hybrid laptop), using the primary monitor");
+    }
+    Log("fullscreen: %ldx%ld at (%ld, %ld)", rect.right - rect.left, rect.bottom - rect.top, rect.left, rect.top);
+    return rect;
+}
+
+void CreateSwapChain(Gpu& gpu, HWND window)
+{
+    RECT client{};
+    GetClientRect(window, &client);
+    gpu.width = UINT(client.right - client.left);
+    gpu.height = UINT(client.bottom - client.top);
 
     DXGI_SWAP_CHAIN_DESC1 scDesc{};
-    scDesc.Width = width;
-    scDesc.Height = height;
+    scDesc.Width = gpu.width;
+    scDesc.Height = gpu.height;
     scDesc.Format = kBackBufferFormat;
     scDesc.SampleDesc.Count = 1;
     scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -126,8 +235,8 @@ void CreateGpu(Gpu& gpu, HWND window, UINT width, UINT height)
     scDesc.Scaling = DXGI_SCALING_STRETCH;
     scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     ComPtr<IDXGISwapChain1> swapChain1;
-    CHECK(factory->CreateSwapChainForHwnd(gpu.queue.Get(), window, &scDesc, nullptr, nullptr, &swapChain1));
-    CHECK(factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER));
+    CHECK(gpu.factory->CreateSwapChainForHwnd(gpu.queue.Get(), window, &scDesc, nullptr, nullptr, &swapChain1));
+    CHECK(gpu.factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER));
     CHECK(swapChain1.As(&gpu.swapChain));
 
     gpu.backBufferRtvs = CreateDescriptorHeap(gpu.device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kBackBufferCount, false);
@@ -214,7 +323,7 @@ ComPtr<ID3DBlob> CompileShader(const char* source, const char* entryPoint, const
     HRESULT hr = D3DCompile(source, strlen(source), "vramtiming.hlsl", nullptr, nullptr, entryPoint, target,
         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
     if (FAILED(hr) && errors)
-        printf("Shader compile error (%s): %s\n", entryPoint, (const char*)errors->GetBufferPointer());
+        Log("Shader compile error (%s): %s", entryPoint, (const char*)errors->GetBufferPointer());
     CheckHr(hr, "D3DCompile");
     return code;
 }
