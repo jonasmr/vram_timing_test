@@ -38,7 +38,11 @@ The executable is written to `build\bin\Release\vramtiming.exe`.
 
 ```
 vramtiming.exe <seconds> <size>[d] [<size>[d] ...] [-flip] [-fullscreen]
+vramtiming.exe memorylimittest
 ```
+
+The second form is a separate mode, see [memorylimittest](#memorylimittest). The rest of this section
+is about the first.
 
 - `<seconds>`: how long each block is active.
 - Each `<size>` (in MB) defines a block. Sizes are rounded up to whole 16 MiB render targets (at least
@@ -159,6 +163,63 @@ t=22s  block B B_384..767 | alloc 6144 MB | vram(fast) 6144MB/384 | sys(slow) 0M
 In this run the kernel promoted block B gradually, about 400 MB per second, starting right after block
 A was freed; after 12 s all of B was in video memory, and the timing agrees with `evicted(kernel)`.
 
+## memorylimittest
+
+```
+vramtiming.exe memorylimittest
+```
+
+Finds how much render target memory this process can use before render targets stay in system memory.
+No other arguments are allowed (otherwise it shows the usage, exit code 1).
+
+1. It starts with an empty block `A` and grows it by `kStepMB` = 128 MB (8 render targets `A_0`,
+   `A_1`, ..., the same 16 MiB render targets as above) every second. Every frame it renders all of `A`,
+   the same chain as the normal mode, and times every render target.
+2. After each second's report line (the normal format, with the current allocation) it checks whether
+   anything is in system memory: a render target classified **slow** by the timing, or
+   **`evicted(kernel)` > 0**. Either signal is enough.
+3. If so, it stops growing, logs which signal(s) fired, and keeps rendering the same render targets for
+   `kPageInWaitSeconds` = 5 s, with fresh timing samples, to give the kernel a chance to page them back
+   in.
+4. If after those 5 s neither signal fires any more (no slow render target during the last second and
+   `evicted(kernel)` 0), it logs `paged back in, continuing` and continues growing. Otherwise it stops.
+5. It also stops if `CreateCommittedResource` fails (out of memory), or if `A` reaches 2x the adapter's
+   dedicated video memory with everything still in video memory (`no limit found up to N MB`).
+
+It always runs fullscreen (borderless, as with `-fullscreen`), so the log goes only to `vramtiming.log`.
+At the end it logs a result block, releases all D3D12 objects and shows the result in a message box;
+after closing the box it exits with code 0. If the window is closed or Esc is pressed first, it logs
+how much was fully in video memory so far and exits with code 0 (no message box).
+
+From a run on an RTX 3060 (12 GB) with a 4K desktop:
+
+```
+memorylimittest: block A grows by 128 MB per second (max 24224 MB, 2x dedicated) until render targets stay in system memory for 5 s; Esc stops
+t=1s  block A A_0..7 | alloc 128 MB | vram(fast) 128MB/8 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 1.1 ms
+...
+t=83s  block A A_0..663 | alloc 10624 MB | vram(fast) 10624MB/664 | sys(slow) 0MB/0 | evicted(kernel) 0MB | frame 68.7 ms
+t=84s  block A A_0..671 | alloc 10752 MB | vram(fast) 10624MB/664 | sys(slow) 128MB/8 | evicted(kernel) 96MB | frame 80.5 ms
+t=84s  textures in system memory at 10752 MB allocated (slow 8 RTs / 128 MB, evicted(kernel) 96 MB); rendering 5 s to see if they are paged back in
+t=85s  block A A_0..671 | alloc 10752 MB | vram(fast) 10624MB/664 | sys(slow) 128MB/8 | evicted(kernel) 112MB | frame 80.2 ms
+...
+t=89s  block A A_0..671 | alloc 10752 MB | vram(fast) 10608MB/663 | sys(slow) 144MB/9 | evicted(kernel) 96MB | frame 84.4 ms
+---- result ----
+memory limit: 10624 MB stayed in video memory; at 10752 MB, textures stayed in system memory after 5 s (slow 9 RTs / 144 MB, evicted(kernel) 96 MB)
+adapter NVIDIA GeForce RTX 3060, 12113 MB dedicated video memory
+DXGI local video memory now: budget 10154 MB, current usage 10827 MB
+```
+
+The result line: `10624 MB stayed in video memory` is the largest allocation of `A` at which a check
+found nothing in system memory. `at 10752 MB` is the allocation at which render targets went to system
+memory and stayed there for the whole wait; in parentheses are the signals of the last second: the slow
+render targets (timing) and the kernel's evicted bytes (rounded up to whole MB). The last two lines are
+context: the adapter, and DXGI's `QueryVideoMemoryInfo` budget and current usage for the local segment
+group at that moment (current usage includes the swap chain and everything else of this process).
+
+The result depends on what else uses video memory at the time (other programs, the desktop and its
+resolution, browser windows, ...), since the OS divides video memory among all of them. Run it with as
+little else running as possible, and compare runs only under the same conditions.
+
 ## Validity
 
 The per-render-target timing only detects demotion when demoted render targets are actually accessed
@@ -168,11 +229,15 @@ draw, and the cost shows up only as a huge frame time. On an RTX 2060 a normal 8
 of about 600 ms; we once saw frames of 1-19 s with every render target classified fast. Treat runs with
 such frame times as invalid ground truth.
 
+`memorylimittest` is not fooled by this: it decides on the kernel's `evicted(kernel)` figure as well as
+on the timing, so batch paging still stops it. Its per-second lines include the frame time, so such a
+run can be recognized in the log.
+
 ## Files
 
 | File | Content |
 |---|---|
-| `main.cpp` | the test: command line, blocks, render targets, frame loop, timing, classification, report |
+| `main.cpp` | the test: command line, blocks, render targets, frame loop, timing, classification, report, memorylimittest |
 | `shaders.h` | the HLSL (fullscreen triangle, chain pass, show pass), compiled at startup |
 | `d3d_helpers.h/.cpp` | boilerplate: log, window, device, swap chain, descriptor heaps, shaders, pipelines |
 | `kernelstats.h/.cpp` | the kernel's demoted-bytes query |
